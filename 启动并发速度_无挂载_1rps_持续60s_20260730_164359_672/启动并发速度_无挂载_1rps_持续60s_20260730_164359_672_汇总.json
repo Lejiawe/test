@@ -1,0 +1,25 @@
+[
+  {
+    "storage": "none",
+    "target_rate_per_s": 1,
+    "duration_seconds": 60,
+    "attempts": 60,
+    "api_success_rate_pct": 100.0,
+    "ready_success_rate_pct": 98.333,
+    "cleanup_success_rate_pct": 100.0,
+    "api_latency_mean_ms": 4684.012,
+    "api_latency_p50_ms": 3682.532,
+    "api_latency_p90_ms": 8918.359,
+    "api_latency_p95_ms": 10544.559,
+    "api_latency_p99_ms": 23686.581,
+    "first_command_latency_p50_ms": 9797.457,
+    "first_command_latency_p90_ms": 29836.588,
+    "first_command_latency_p95_ms": 31683.329,
+    "first_command_latency_p99_ms": 65624.136,
+    "second_command_latency_p50_ms": 1489.49,
+    "second_command_latency_p90_ms": 3946.507,
+    "second_command_latency_p95_ms": 6605.216,
+    "second_command_latency_p99_ms": 10882.599,
+    "schedule_delay_p95_ms": 1.284
+  }
+]
