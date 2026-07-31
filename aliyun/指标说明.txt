@@ -1,0 +1,173 @@
+阿里云云沙箱启动并发速度测试——汇总 CSV 指标说明
+
+一、时间点定义
+
+T0：开始调用 Sandbox.create()
+T1：Sandbox.create() 返回，已经获得 Sandbox ID
+T2：第一条 Python 命令执行完成
+T3：第二条 Python 命令执行完成
+
+api_latency_ms = T1 - T0
+first_command_latency_ms = T2 - T1
+second_command_latency_ms = T3 - T2
+
+所有延迟单位均为毫秒（ms），数值越小越好。
+所有成功率单位均为百分比（%），数值越高越好。
+
+
+二、测试基本信息
+
+storage
+存储场景。none 表示无挂载，oss 表示对象存储 OSS，file 表示文件存储 NAS。
+
+target_rate_per_s
+目标启动速率，单位为次/秒。例如数值为 50，表示客户端计划每秒发起
+50 次 Sandbox.create()。
+
+duration_seconds
+持续发压时间，单位为秒。例如数值为 60，表示按照目标速率持续发起请求
+60 秒。
+
+attempts
+本档实际安排的创建请求数量。
+计算公式：attempts = target_rate_per_s × duration_seconds。
+例如 50 次/秒持续 60 秒，共安排 3000 次创建。
+
+
+三、成功率
+
+api_success_rate_pct
+API 创建成功率。表示 Sandbox.create() 成功返回 Sandbox 的请求比例。
+API 创建成功不代表两条命令都执行成功。
+
+ready_success_rate_pct
+两条命令均成功的比例。当前脚本只有在第一条和第二条 Python 命令都返回
+预期标记时，才把本次请求计为 ready_success。
+
+cleanup_success_rate_pct
+资源清理成功率。表示测试结束后成功调用 sandbox.kill() 释放 Sandbox 的
+比例。低于 100% 时应检查是否存在未释放资源。
+
+
+四、API 创建延迟
+
+api_latency 表示从 T0 到 T1，即从开始调用 Sandbox.create() 到返回
+Sandbox ID 的时间。
+
+api_latency_min_ms
+所有 API 创建成功样本中的最小值，代表本轮最佳 API 创建延迟。
+
+api_latency_max_ms
+所有 API 创建成功样本中的最大值，代表本轮最慢 API 创建延迟。
+
+api_latency_mean_ms
+所有 API 创建成功样本的算术平均值。
+计算公式：有效 API 延迟总和 ÷ 有效 API 样本数。
+
+api_latency_p50_ms
+50% 的有效 API 样本不超过该值，也称中位数，代表典型表现。
+
+api_latency_p90_ms
+90% 的有效 API 样本不超过该值，剩余约 10% 更慢。
+
+api_latency_p95_ms
+95% 的有效 API 样本不超过该值，常用于观察尾延迟。
+
+api_latency_p99_ms
+99% 的有效 API 样本不超过该值，反映最慢约 1% 请求的情况。样本较少时，
+P99 可能等于最大值。
+
+
+五、第一条命令延迟
+
+first_command_latency 表示从 T1 到 T2，即 Sandbox.create() 已经返回后，
+到第一条 Python 命令执行完成的时间。它反映 Sandbox 第一次真正执行命令
+还需要等待多久。
+
+first_command_latency_min_ms
+所有第一条命令有效样本中的最小值。
+
+first_command_latency_max_ms
+所有第一条命令有效样本中的最大值。
+
+first_command_latency_mean_ms
+所有第一条命令有效样本的算术平均值。
+计算公式：有效第一条命令延迟总和 ÷ 有效第一条命令样本数。
+
+first_command_latency_p50_ms
+50% 的第一条命令有效样本不超过该值。
+
+first_command_latency_p90_ms
+90% 的第一条命令有效样本不超过该值。
+
+first_command_latency_p95_ms
+95% 的第一条命令有效样本不超过该值。
+
+first_command_latency_p99_ms
+99% 的第一条命令有效样本不超过该值。
+
+
+六、第二条命令延迟
+
+second_command_latency 表示从 T2 到 T3，即第一条命令完成后，到第二条
+Python 命令执行完成的时间。它反映 Sandbox 已经完成首次功能就绪后，
+再次执行命令的耗时。
+
+second_command_latency_min_ms
+所有第二条命令有效样本中的最小值。
+
+second_command_latency_max_ms
+所有第二条命令有效样本中的最大值。
+
+second_command_latency_mean_ms
+所有第二条命令有效样本的算术平均值。
+计算公式：有效第二条命令延迟总和 ÷ 有效第二条命令样本数。
+如果部分请求在第一条命令阶段失败，第二条命令样本数会少于 attempts，
+平均值应除以实际有效样本数，而不是固定除以 attempts。
+
+second_command_latency_p50_ms
+50% 的第二条命令有效样本不超过该值。
+
+second_command_latency_p90_ms
+90% 的第二条命令有效样本不超过该值。
+
+second_command_latency_p95_ms
+95% 的第二条命令有效样本不超过该值。
+
+second_command_latency_p99_ms
+99% 的第二条命令有效样本不超过该值。
+
+
+七、本地发压调度延迟
+
+schedule_delay_p95_ms
+95% 的请求相对计划发起时间的本地延误不超过该值。这个指标衡量本地电脑
+能否按照目标速率发压，不是阿里云 Sandbox 本身的启动延迟。
+
+例如目标速率为 50 次/秒时，理论上每隔 20 ms 发起一个请求。如果
+schedule_delay_p95_ms 只有几毫秒，说明本地调度正常；如果达到数百或数千
+毫秒，说明本地线程、CPU 或本地网络可能已经成为瓶颈。
+
+
+八、min、max、mean 和分位数的区别
+
+min：本轮所有有效样本中的最小值，代表最佳情况。
+max：本轮所有有效样本中的最大值，代表最慢情况，容易受单个异常请求影响。
+mean：所有有效样本的算术平均值，也会受到极慢请求影响。
+P50：典型表现，一半样本快于或等于该值。
+P90：90% 样本快于或等于该值。
+P95：95% 样本快于或等于该值，常用于报告尾延迟。
+P99：99% 样本快于或等于该值，用于观察极端尾延迟。
+
+分析时建议同时查看 mean、P50、P95 和 P99。mean 明显大于 P50 时，通常
+说明存在一部分非常慢的长尾请求。
+
+
+九、注意事项
+
+1. duration_seconds 只控制持续发请求的时间，不是单个 Sandbox 的运行时间。
+2. target_rate_per_s=50、duration_seconds=60 表示创建 3000 个 Sandbox。
+3. 各阶段只使用该阶段存在有效延迟值的样本计算统计量。
+4. API、第一条命令和第二条命令的有效样本数可能不同。
+5. 不要把 min、max、mean、P50、P95 或 P99 再除以 attempts；它们已经是
+   单次请求延迟的统计值。
