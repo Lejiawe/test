@@ -1,0 +1,33 @@
+[
+  {
+    "storage": "none",
+    "target_rate_per_s": 50,
+    "duration_seconds": 59,
+    "attempts": 2950,
+    "api_success_rate_pct": 19.322,
+    "ready_success_rate_pct": 19.322,
+    "cleanup_success_rate_pct": 100.0,
+    "api_latency_min_ms": 301.415,
+    "api_latency_max_ms": 11563.537,
+    "api_latency_mean_ms": 4077.6,
+    "api_latency_p50_ms": 3628.865,
+    "api_latency_p90_ms": 7355.886,
+    "api_latency_p95_ms": 9670.515,
+    "api_latency_p99_ms": 11332.819,
+    "first_command_latency_min_ms": 217.898,
+    "first_command_latency_max_ms": 17664.725,
+    "first_command_latency_mean_ms": 8861.158,
+    "first_command_latency_p50_ms": 7987.278,
+    "first_command_latency_p90_ms": 16598.663,
+    "first_command_latency_p95_ms": 16755.982,
+    "first_command_latency_p99_ms": 16956.994,
+    "second_command_latency_min_ms": 39.464,
+    "second_command_latency_max_ms": 15624.881,
+    "second_command_latency_mean_ms": 1660.59,
+    "second_command_latency_p50_ms": 1424.368,
+    "second_command_latency_p90_ms": 3494.449,
+    "second_command_latency_p95_ms": 4076.509,
+    "second_command_latency_p99_ms": 5351.645,
+    "schedule_delay_p95_ms": 23189.28
+  }
+]
