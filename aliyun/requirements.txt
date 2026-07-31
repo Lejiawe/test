@@ -1,0 +1,32 @@
+e2b==2.31.0
+e2b-code-interpreter==2.8.1
+python-dotenv==1.2.2
+
+
+cd C:\Users\le\Desktop\aliyun
+conda activate aliyun
+
+
+
+一、启动并发速度
+python benchmark.py run --rates 1 --duration-seconds 60 --storages none --confirm
+python benchmark.py run --rates 10 --duration-seconds 60 --storages none --confirm
+python benchmark.py run --rates 50 --duration-seconds 60 --storages none --confirm
+python benchmark.py run --rates 100 --duration-seconds 60 --storages none --confirm
+python benchmark.py run --rates 200 --duration-seconds 60 --storages none --confirm
+
+二、对象存储 OSS：全部档位
+需要先在 .env 配置 E2B_OSS_CONFIG_JSON 和 E2B_ROLE_ARN。
+python benchmark.py run --rates 1 --duration-seconds 1 --storages oss --confirm
+python benchmark.py run --rates 10 --duration-seconds 1 --storages oss --confirm
+python benchmark.py run --rates 50 --duration-seconds 1 --storages oss --confirm
+python benchmark.py run --rates 100 --duration-seconds 1 --storages oss --confirm
+python benchmark.py run --rates 200 --duration-seconds 1 --storages oss --confirm
+
+三、文件存储 NAS：全部档位
+需要先在 .env 配置 E2B_FILE_METADATA_KEY、E2B_FILE_CONFIG_JSON，通常还需要 VPC 配置。
+python benchmark.py run --rates 1 --duration-seconds 1 --storages file --confirm
+python benchmark.py run --rates 10 --duration-seconds 1 --storages file --confirm
+python benchmark.py run --rates 50 --duration-seconds 1 --storages file --confirm
+python benchmark.py run --rates 100 --duration-seconds 1 --storages file --confirm
+python benchmark.py run --rates 200 --duration-seconds 1 --storages file --confirm
