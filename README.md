@@ -96,26 +96,9 @@ python -m pip install -r requirements.txt
 
 这种方式最简单，但依赖会安装到当前 Python 环境。
 
-### 3.2 方式B：使用 Conda 环境（可选）
 
-只有希望使用 Conda 隔离依赖时才执行本节。
 
-如果 `aliyun` 环境尚不存在：
-
-```powershell
-conda create -n aliyun python=3.11 pip -y
-conda activate aliyun
-python -m pip install -r requirements.txt
-```
-
-如果 `aliyun` 环境已经存在：
-
-```powershell
-conda activate aliyun
-python -m pip install -r requirements.txt
-```
-
-### 3.3 方式C：使用 Python venv（可选）
+### 3.2 方式B：使用 Python venv（可选）
 
 不使用 Conda 时，也可以用 Python 自带的 venv：
 
@@ -132,7 +115,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 3.4 依赖版本
+### 3.3 依赖版本
 
 当前项目固定使用：
 
@@ -142,7 +125,7 @@ e2b-code-interpreter==2.8.1
 python-dotenv==1.2.2
 ```
 
-### 3.5 检查当前环境
+### 3.4 检查当前环境
 
 ```powershell
 python --version
