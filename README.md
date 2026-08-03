@@ -403,10 +403,10 @@ python benchmark.py run --rates 200 --duration-seconds 60 --storages none --conf
 脚本默认：
 
 ```text
---max-workers 256
+--max-workers 1000
 ```
 
-如果云端创建或命令执行耗时较长，256个工作线程可能全部被占用，后续任务会
+如果云端创建或命令执行耗时较长，1000个工作线程仍可能全部被占用，后续任务会
 在本地排队。此时即使命令写的是 `100/s` 或 `200/s`，实际也可能达不到目标
 速率。
 
@@ -430,17 +430,24 @@ schedule_delay_p95_ms
 
 ## 10. 结果目录和文件
 
+脚本使用 `--provider` 指定厂商目录，默认值是 `aliyun`。这个参数负责结果归类，
+不会自动切换 SDK、API 地址或厂商实现。以后接入其他厂商时，应在对应实现和
+环境变量都配置正确后再使用相应标识，例如 `vol` 或 `ags`。
+
 每次测试会按照“测试内容 + 存储类型 + 档位 + 持续时间 + 时间戳”生成独立
 目录。例如：
 
 ```text
 results/
-└── 启动并发速度_无挂载_50rps_持续60s_20260731_120000_123/
-    ├── 启动并发速度_无挂载_50rps_持续60s_20260731_120000_123_原始明细.csv
-    ├── 启动并发速度_无挂载_50rps_持续60s_20260731_120000_123_汇总.csv
-    ├── 启动并发速度_无挂载_50rps_持续60s_20260731_120000_123_汇总.json
-    ├── 启动并发速度_无挂载_50rps_持续60s_20260731_120000_123_失败日志.csv
-    └── 启动并发速度_无挂载_50rps_持续60s_20260731_120000_123_失败日志.txt
+├── 全局测试结果.csv
+├── 全局测试历史.csv
+└── aliyun/
+    └── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123/
+        ├── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_原始明细.csv
+        ├── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_汇总.csv
+        ├── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_汇总.json
+        ├── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_失败日志.csv
+        └── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_失败日志.txt
 ```
 
 各文件用途：
@@ -452,6 +459,40 @@ results/
 | `汇总.json` | 与汇总 CSV 相同的 JSON 数据 |
 | `失败日志.csv` | 只保留失败请求，方便 Excel 筛选和统计 |
 | `失败日志.txt` | 失败阶段、错误信息和完整异常堆栈 |
+| `results/全局测试结果.csv` | 跨厂商最新结果矩阵，档位列为 `1tps`、`10tps`、`50tps` 等 |
+| `results/全局测试历史.csv` | 跨厂商完整历史；每行对应一次运行中的一个厂商、存储、TPS档位和持续时间 |
+
+正式执行 `run` 后，当前测试的每个档位会先追加到
+`results/全局测试历史.csv`。历史表中的 `run_id`、`completed_at_local` 和
+`result_directory` 可以定位到原始测试目录，同一厂商重复测试同一档位不会覆盖。
+
+随后脚本会根据历史表重建 `results/全局测试结果.csv`。矩阵每行由
+`test_name + provider + storage + duration_seconds + metric` 唯一确定，各档位分别
+放在 `1tps`、`10tps`、`50tps`、`100tps`、`200tps` 等列中。例如：
+
+```text
+test_name,provider,storage,duration_seconds,metric,unit,1tps,10tps,50tps
+启动并发速度,aliyun,none,60,api_latency_p50_ms,ms,420.1,510.2,890.4
+启动并发速度,vol,none,60,api_latency_p50_ms,ms,380.3,470.5,760.8
+启动并发速度,ags,none,60,api_latency_p50_ms,ms,401.6,488.9,801.2
+```
+
+同一厂商、存储、持续时间和指标重复测试同一TPS时，矩阵采用最后一次测试值；
+旧值仍完整保留在历史表中。只运行一个档位时，其他已测档位不会丢失。
+`smoke` 连通性测试不会写入这两个全局表。
+
+厂商归档示例：
+
+```powershell
+# 阿里云（默认值，--provider aliyun 可以省略）
+python benchmark.py run --provider aliyun --rates 50 --duration-seconds 60 --storages none --confirm
+
+# 未来接入火山引擎实现后
+python benchmark.py run --provider vol --rates 50 --duration-seconds 60 --storages none --confirm
+
+# 未来接入 AGS 兼容实现后
+python benchmark.py run --provider ags --rates 50 --duration-seconds 60 --storages none --confirm
+```
 
 即使本轮没有失败，也会生成失败日志：
 
@@ -466,9 +507,13 @@ results/
 
 | 指标 | 含义 |
 |---|---|
+| `provider` | 厂商标识，例如 `aliyun`、`vol`、`ags` |
 | `storage` | 存储场景，`none` 表示无挂载 |
 | `target_rate_per_s` | 目标启动速率，单位为次/秒 |
+| `rate_label` | 便于制作对比矩阵的档位标签，例如 `1tps`、`10tps`、`50tps` |
 | `duration_seconds` | 持续发压时间，单位为秒 |
+| `configured_max_workers` | 命令配置的线程上限，默认1000 |
+| `effective_max_workers` | 当前档位实际建立的最大线程数，不超过请求总数 |
 | `attempts` | 计划并实际安排的请求数量 |
 
 ### 11.2 成功率
@@ -494,9 +539,13 @@ T3：第二条命令执行完成
 
 ```text
 api_latency = T1 - T0
-first_command_latency = T2 - T1
-second_command_latency = T3 - T2
+first_command_latency = T2 - T0
+second_command_latency = T3 - T0
 ```
+
+三项都是以 `Sandbox.create()` 开始调用的 T0 为起点，因此在同一个成功样本中
+应满足：`api_latency <= first_command_latency <= second_command_latency`。
+第一条和第二条命令延迟现在都是累计就绪时间，不再是相邻阶段自身的耗时。
 
 三段延迟都输出：
 

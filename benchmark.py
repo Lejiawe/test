@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import threading
@@ -21,6 +22,8 @@ from e2b_code_interpreter import Sandbox
 
 
 STORAGE_CHOICES = ("none", "oss", "file")
+DEFAULT_PROVIDER = "aliyun"
+DEFAULT_MAX_WORKERS = 1000
 PRINT_LOCK = threading.Lock()
 
 
@@ -41,9 +44,12 @@ class Settings:
 
 @dataclass
 class TrialResult:
+    provider: str
     storage: str
     target_rate_per_s: int
     duration_seconds: float
+    configured_max_workers: int
+    effective_max_workers: int
     trial_index: int
     scheduled_at_utc: str
     queue_delay_ms: float
@@ -137,9 +143,12 @@ def metadata_for(storage: str, settings: Settings) -> dict[str, str]:
 def one_trial(
     *,
     settings: Settings,
+    provider: str,
     storage: str,
     rate: int,
     duration_seconds: float,
+    configured_max_workers: int,
+    effective_max_workers: int,
     trial_index: int,
     scheduled_monotonic: float,
     scheduled_at_utc: str,
@@ -187,7 +196,7 @@ def one_trial(
             timeout=30,
         )
         first_command_ready = time.perf_counter()
-        first_command_latency_ms = (first_command_ready - api_return) * 1000
+        first_command_latency_ms = (first_command_ready - create_start) * 1000
         first_stdout = getattr(first_result, "stdout", "") or ""
         first_command_success = "ALIYUN_SANDBOX_FIRST_COMMAND" in first_stdout
         if not first_command_success:
@@ -201,9 +210,7 @@ def one_trial(
                 timeout=30,
             )
             second_command_ready = time.perf_counter()
-            second_command_latency_ms = (
-                second_command_ready - first_command_ready
-            ) * 1000
+            second_command_latency_ms = (second_command_ready - create_start) * 1000
             second_stdout = getattr(second_result, "stdout", "") or ""
             ready_success = "ALIYUN_SANDBOX_SECOND_COMMAND" in second_stdout
             if not ready_success:
@@ -231,6 +238,7 @@ def one_trial(
                 cleanup_error_traceback = traceback.format_exc()
 
     return TrialResult(
+        provider=provider,
         storage=storage,
         target_rate_per_s=rate,
         duration_seconds=(
@@ -238,6 +246,8 @@ def one_trial(
             if float(duration_seconds).is_integer()
             else duration_seconds
         ),
+        configured_max_workers=configured_max_workers,
+        effective_max_workers=effective_max_workers,
         trial_index=trial_index,
         scheduled_at_utc=scheduled_at_utc,
         queue_delay_ms=round(queue_delay_ms, 3),
@@ -268,18 +278,20 @@ def one_trial(
 
 def run_rate(
     settings: Settings,
+    provider: str,
     storage: str,
     rate: int,
     duration_seconds: float,
     max_workers: int,
 ) -> list[TrialResult]:
     attempts = max(1, math.ceil(rate * duration_seconds))
+    effective_max_workers = min(max_workers, attempts)
     futures: list[Future[TrialResult]] = []
     run_start = time.perf_counter() + 0.25
     utc_start = datetime.now(timezone.utc).timestamp() + 0.25
 
     with ThreadPoolExecutor(
-        max_workers=min(max_workers, attempts),
+        max_workers=effective_max_workers,
         thread_name_prefix="sandbox-create",
     ) as pool:
         for index in range(attempts):
@@ -294,9 +306,12 @@ def run_rate(
                 pool.submit(
                     one_trial,
                     settings=settings,
+                    provider=provider,
                     storage=storage,
                     rate=rate,
                     duration_seconds=duration_seconds,
+                    configured_max_workers=max_workers,
+                    effective_max_workers=effective_max_workers,
                     trial_index=index + 1,
                     scheduled_monotonic=scheduled,
                     scheduled_at_utc=scheduled_utc,
@@ -326,14 +341,29 @@ def percentile(values: Iterable[float], percent: float) -> float | None:
 
 
 def summarize(results: list[TrialResult]) -> list[dict]:
-    groups: dict[tuple[str, int, float], list[TrialResult]] = {}
+    groups: dict[tuple[str, str, int, float, int, int], list[TrialResult]] = {}
     for row in results:
         groups.setdefault(
-            (row.storage, row.target_rate_per_s, row.duration_seconds), []
+            (
+                row.provider,
+                row.storage,
+                row.target_rate_per_s,
+                row.duration_seconds,
+                row.configured_max_workers,
+                row.effective_max_workers,
+            ),
+            [],
         ).append(row)
 
     summary = []
-    for (storage, rate, duration_seconds), rows in sorted(groups.items()):
+    for (
+        provider,
+        storage,
+        rate,
+        duration_seconds,
+        configured_max_workers,
+        effective_max_workers,
+    ), rows in sorted(groups.items()):
         api = [row.api_latency_ms for row in rows if row.api_latency_ms is not None]
         command = [
             row.first_command_latency_ms
@@ -349,9 +379,13 @@ def summarize(results: list[TrialResult]) -> list[dict]:
         attempts = len(rows)
         summary.append(
             {
+                "provider": provider,
                 "storage": storage,
                 "target_rate_per_s": rate,
+                "rate_label": f"{rate}tps",
                 "duration_seconds": duration_seconds,
+                "configured_max_workers": configured_max_workers,
+                "effective_max_workers": effective_max_workers,
                 "attempts": attempts,
                 "api_success_rate_pct": round(
                     100 * sum(row.api_success for row in rows) / attempts, 3
@@ -421,6 +455,141 @@ def write_csv(
         )
         writer.writeheader()
         writer.writerows(rows)
+
+
+def append_global_summary(
+    path: Path,
+    rows: list[dict],
+) -> None:
+    """Append result rows while preserving any columns added by future versions."""
+    existing_rows: list[dict] = []
+    fieldnames: list[str] = []
+    if path.exists():
+        with path.open("r", newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames.extend(reader.fieldnames or [])
+            existing_rows.extend(reader)
+
+    for row in rows:
+        for name in row:
+            if name not in fieldnames:
+                fieldnames.append(name)
+
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    write_csv(temp_path, existing_rows + rows, fieldnames=fieldnames)
+    temp_path.replace(path)
+
+
+GLOBAL_HISTORY_DIMENSIONS = {
+    "run_id",
+    "test_name",
+    "completed_at_local",
+    "result_directory",
+    "provider",
+    "storage",
+    "target_rate_per_s",
+    "rate_label",
+    "duration_seconds",
+}
+
+
+def metric_unit(metric: str) -> str:
+    if metric.endswith("_ms"):
+        return "ms"
+    if metric.endswith("_pct"):
+        return "%"
+    if metric in {"attempts", "configured_max_workers", "effective_max_workers"}:
+        return "count"
+    return ""
+
+
+def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
+    """Rebuild a latest-value vendor/rate matrix from the append-only history."""
+    if not history_path.exists():
+        return
+
+    with history_path.open("r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        history_rows = list(reader)
+        history_fields = reader.fieldnames or []
+
+    metric_fields = [
+        field for field in history_fields if field not in GLOBAL_HISTORY_DIMENSIONS
+    ]
+    rates = sorted(
+        {
+            int(float(row["target_rate_per_s"]))
+            for row in history_rows
+            if row.get("target_rate_per_s", "").strip()
+        }
+    )
+    rate_columns = [f"{rate}tps" for rate in rates]
+
+    # History is append-only, so later rows intentionally replace earlier cells.
+    matrix: dict[tuple[str, str, str, str, str], dict[str, str]] = {}
+    for row in history_rows:
+        raw_rate = row.get("target_rate_per_s", "").strip()
+        if not raw_rate:
+            continue
+        rate_column = f"{int(float(raw_rate))}tps"
+        for metric in metric_fields:
+            value = row.get(metric, "")
+            if value in (None, ""):
+                continue
+            key = (
+                row.get("test_name", ""),
+                row.get("provider", ""),
+                row.get("storage", ""),
+                row.get("duration_seconds", ""),
+                metric,
+            )
+            matrix.setdefault(key, {})[rate_column] = value
+
+    metric_order = {name: index for index, name in enumerate(metric_fields)}
+
+    def duration_sort_value(value: str) -> tuple[int, float | str]:
+        try:
+            return (0, float(value))
+        except ValueError:
+            return (1, value)
+
+    matrix_rows = []
+    sorted_keys = sorted(
+        matrix,
+        key=lambda key: (
+            key[0],
+            key[2],
+            duration_sort_value(key[3]),
+            metric_order.get(key[4], len(metric_order)),
+            key[1],
+        ),
+    )
+    for test_name, provider, storage, duration_seconds, metric in sorted_keys:
+        values = matrix[(test_name, provider, storage, duration_seconds, metric)]
+        matrix_rows.append(
+            {
+                "test_name": test_name,
+                "provider": provider,
+                "storage": storage,
+                "duration_seconds": duration_seconds,
+                "metric": metric,
+                "unit": metric_unit(metric),
+                **{column: values.get(column, "") for column in rate_columns},
+            }
+        )
+
+    fieldnames = [
+        "test_name",
+        "provider",
+        "storage",
+        "duration_seconds",
+        "metric",
+        "unit",
+        *rate_columns,
+    ]
+    temp_path = matrix_path.with_suffix(matrix_path.suffix + ".tmp")
+    write_csv(temp_path, matrix_rows, fieldnames=fieldnames)
+    temp_path.replace(matrix_path)
 
 
 def write_failure_logs(
@@ -500,7 +669,7 @@ def result_title(results: list[TrialResult], test_name: str) -> str:
     rates = sorted({row.target_rate_per_s for row in results})
     durations = sorted({row.duration_seconds for row in results})
     storage_part = "-".join(storage_names.get(item, item) for item in storages)
-    rate_part = "-".join(str(rate) for rate in rates) + "rps"
+    rate_part = "-".join(str(rate) for rate in rates) + "tps"
     duration_part = "-".join(
         str(int(value)) if float(value).is_integer() else f"{value:g}"
         for value in durations
@@ -513,9 +682,16 @@ def save_results(
     results: list[TrialResult],
     output_root: Path,
     test_name: str,
+    add_to_global: bool = False,
 ) -> Path:
+    if not results:
+        raise RuntimeError("没有可保存的测试结果")
+    providers = {row.provider for row in results}
+    if len(providers) != 1:
+        raise RuntimeError("同一结果目录只能保存一个厂商的测试结果")
+    provider = next(iter(providers))
     title = result_title(results, test_name)
-    output_dir = output_root / title
+    output_dir = output_root / provider / title
     output_dir.mkdir(parents=True, exist_ok=False)
     raw_rows = [asdict(row) for row in results]
     summary_rows = summarize(results)
@@ -526,6 +702,21 @@ def save_results(
         json.dumps(summary_rows, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if add_to_global:
+        completed_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        global_rows = [
+            {
+                "run_id": title,
+                "test_name": test_name,
+                "completed_at_local": completed_at,
+                "result_directory": str(Path(provider) / title),
+                **row,
+            }
+            for row in summary_rows
+        ]
+        history_path = output_root / "全局测试历史.csv"
+        append_global_summary(history_path, global_rows)
+        refresh_global_matrix(history_path, output_root / "全局测试结果.csv")
     return output_dir
 
 
@@ -549,6 +740,15 @@ def parse_storages(value: str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def parse_provider(value: str) -> str:
+    provider = value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", provider):
+        raise argparse.ArgumentTypeError(
+            "厂商标识只允许小写字母、数字、下划线和短横线，最长 64 个字符"
+        )
+    return provider
+
+
 def attempts_for(rates: list[int], duration: float, storages: list[str]) -> int:
     return sum(max(1, math.ceil(rate * duration)) for rate in rates) * len(storages)
 
@@ -563,11 +763,20 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument(
         "--storage", choices=STORAGE_CHOICES, default="none", help="存储场景"
     )
+    smoke.add_argument(
+        "--provider", type=parse_provider, default=DEFAULT_PROVIDER, help="厂商标识"
+    )
     smoke.add_argument("--output", type=Path, default=Path("results"))
 
     plan = subparsers.add_parser("plan", help="只计算测试规模，不调用云端")
     run = subparsers.add_parser("run", help="执行正式并发测试")
     for target in (plan, run):
+        target.add_argument(
+            "--provider",
+            type=parse_provider,
+            default=DEFAULT_PROVIDER,
+            help=f"厂商标识，默认 {DEFAULT_PROVIDER}",
+        )
         target.add_argument(
             "--rates",
             type=parse_csv_ints,
@@ -589,8 +798,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--max-workers",
         type=int,
-        default=256,
-        help="本地创建线程上限，默认 256",
+        default=DEFAULT_MAX_WORKERS,
+        help=f"本地创建线程上限，默认 {DEFAULT_MAX_WORKERS}",
     )
     run.add_argument("--output", type=Path, default=Path("results"))
     run.add_argument(
@@ -601,7 +810,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def print_plan(rates: list[int], duration: float, storages: list[str]) -> None:
+def print_plan(
+    provider: str,
+    rates: list[int],
+    duration: float,
+    storages: list[str],
+) -> None:
+    print(f"厂商标识: {provider}")
     print(f"存储场景: {', '.join(storages)}")
     print(f"并发档位: {', '.join(str(rate) + '/s' for rate in rates)}")
     print(f"每档持续: {duration:g} 秒")
@@ -619,7 +834,7 @@ def main() -> int:
     if args.command == "plan":
         if args.duration_seconds <= 0:
             raise RuntimeError("--duration-seconds 必须大于 0")
-        print_plan(args.rates, args.duration_seconds, args.storages)
+        print_plan(args.provider, args.rates, args.duration_seconds, args.storages)
         return 0
 
     settings = load_settings(require_credentials=True)
@@ -628,9 +843,12 @@ def main() -> int:
         print(f"开始 smoke 测试，存储场景={args.storage}")
         result = one_trial(
             settings=settings,
+            provider=args.provider,
             storage=args.storage,
             rate=1,
             duration_seconds=1.0,
+            configured_max_workers=1,
+            effective_max_workers=1,
             trial_index=1,
             scheduled_monotonic=time.perf_counter(),
             scheduled_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -646,7 +864,7 @@ def main() -> int:
         raise RuntimeError("--max-workers 必须大于 0")
     for storage in args.storages:
         metadata_for(storage, settings)
-    print_plan(args.rates, args.duration_seconds, args.storages)
+    print_plan(args.provider, args.rates, args.duration_seconds, args.storages)
     if not args.confirm:
         print("\n未执行：正式测试请在命令末尾加 --confirm。")
         return 2
@@ -658,13 +876,19 @@ def main() -> int:
             all_results.extend(
                 run_rate(
                     settings=settings,
+                    provider=args.provider,
                     storage=storage,
                     rate=rate,
                     duration_seconds=args.duration_seconds,
                     max_workers=args.max_workers,
                 )
             )
-    output_dir = save_results(all_results, args.output, "启动并发速度")
+    output_dir = save_results(
+        all_results,
+        args.output,
+        "启动并发速度",
+        add_to_global=True,
+    )
     print(f"\n完成。结果目录: {output_dir.resolve()}")
     print(json.dumps(summarize(all_results), ensure_ascii=False, indent=2))
     return 0

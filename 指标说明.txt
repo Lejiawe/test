@@ -1,4 +1,4 @@
-阿里云云沙箱启动并发速度测试——汇总 CSV 指标说明
+云沙箱启动并发速度测试——汇总 CSV 指标说明
 
 一、时间点定义
 
@@ -8,8 +8,11 @@ T2：第一条 Python 命令执行完成
 T3：第二条 Python 命令执行完成
 
 api_latency_ms = T1 - T0
-first_command_latency_ms = T2 - T1
-second_command_latency_ms = T3 - T2
+first_command_latency_ms = T2 - T0
+second_command_latency_ms = T3 - T0
+
+三项均从 create start（T0）开始累计。对于同一个完整成功的样本，应满足：
+api_latency_ms <= first_command_latency_ms <= second_command_latency_ms
 
 所有延迟单位均为毫秒（ms），数值越小越好。
 所有成功率单位均为百分比（%），数值越高越好。
@@ -17,12 +20,19 @@ second_command_latency_ms = T3 - T2
 
 二、测试基本信息
 
+provider
+厂商标识，例如 aliyun、vol、ags。它用于结果目录和全局汇总表归类，
+本身不会自动切换 SDK 或 API 地址。
+
 storage
 存储场景。none 表示无挂载，oss 表示对象存储 OSS，file 表示文件存储 NAS。
 
 target_rate_per_s
 目标启动速率，单位为次/秒。例如数值为 50，表示客户端计划每秒发起
 50 次 Sandbox.create()。
+
+rate_label
+目标启动速率的显示标签，例如 1tps、10tps、50tps，方便生成跨厂商对比矩阵。
 
 duration_seconds
 持续发压时间，单位为秒。例如数值为 60，表示按照目标速率持续发起请求
@@ -32,6 +42,13 @@ attempts
 本档实际安排的创建请求数量。
 计算公式：attempts = target_rate_per_s × duration_seconds。
 例如 50 次/秒持续 60 秒，共安排 3000 次创建。
+
+configured_max_workers
+命令配置的本地工作线程上限，当前默认值为 1000。
+
+effective_max_workers
+当前档位实际使用的最大工作线程数。它等于 configured_max_workers 和当前
+档位 attempts 中较小的一个。
 
 
 三、成功率
@@ -80,9 +97,9 @@ P99 可能等于最大值。
 
 五、第一条命令延迟
 
-first_command_latency 表示从 T1 到 T2，即 Sandbox.create() 已经返回后，
-到第一条 Python 命令执行完成的时间。它反映 Sandbox 第一次真正执行命令
-还需要等待多久。
+first_command_latency 表示从 T0 到 T2，即从开始调用 Sandbox.create()，
+到第一条 Python 命令执行完成的累计时间。它包括 API 创建延迟和首次命令
+执行就绪所需时间。
 
 first_command_latency_min_ms
 所有第一条命令有效样本中的最小值。
@@ -109,9 +126,9 @@ first_command_latency_p99_ms
 
 六、第二条命令延迟
 
-second_command_latency 表示从 T2 到 T3，即第一条命令完成后，到第二条
-Python 命令执行完成的时间。它反映 Sandbox 已经完成首次功能就绪后，
-再次执行命令的耗时。
+second_command_latency 表示从 T0 到 T3，即从开始调用 Sandbox.create()，
+到第二条 Python 命令执行完成的累计时间。它包括 API 创建、第一条命令和
+第二条命令完成前的全部时间。
 
 second_command_latency_min_ms
 所有第二条命令有效样本中的最小值。
