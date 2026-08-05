@@ -1,7 +1,7 @@
-# 阿里云 FC 云沙箱启动并发速度测试
+# 多产品云沙箱启动并发速度测试
 
-本项目是在 Windows 本地运行的压测客户端，通过 E2B Python SDK 调用阿里云
-Function Compute 云沙箱。它不会在本机部署云沙箱服务端。
+本项目是在 Windows 本地运行的压测客户端：阿里云使用 E2B Python SDK，字节/
+火山引擎使用 veFaaS 原生 Python SDK。它不会在本机部署云沙箱服务端。
 
 本文说明三类启动并发速度测试：
 
@@ -18,6 +18,219 @@ Function Compute 云沙箱。它不会在本机部署云沙箱服务端。
 无挂载测试按本文要求每档持续发压60秒；OSS/NAS 示例命令每档持续发压1秒。
 每次运行都会生成独立的 CSV、JSON 和失败日志。
 
+程序执行过程如下：
+
+```text
+读取 benchmark.ini
+→ 根据 [run].product 选择阿里云或字节/火山
+→ 按 rates 和 duration_seconds 生成定时启动任务
+→ 并发创建 Sandbox 并等待功能就绪
+→ 清理本轮创建的 Sandbox
+→ 写入本次原始明细、汇总、失败日志
+→ 追加全局历史 CSV，并更新跨厂商结果矩阵
+```
+
+阿里云驱动以创建返回、第一条命令完成、第二条命令完成作为三个累计里程碑；
+火山原生驱动以创建返回、首次 Ready、二次 Ready 确认作为三个累计里程碑。
+三项延迟都从本次创建开始计时。默认情况下，每个TPS档位的第一个沙箱不参与
+`mean`，但仍参与 `min`、`max`、P50、P90、P95、P99和成功率统计。
+
+---
+
+## 下载后快速运行
+
+以下命令适合第一次从 GitHub 下载本项目的用户。所有命令都在 PowerShell 中
+执行，不需要把项目放到固定盘符或固定目录。
+
+### 1. 下载并进入项目
+
+```powershell
+git clone https://github.com/Lejiawe/test.git
+Set-Location test
+```
+
+如果已经通过浏览器下载并解压 ZIP，则在解压后的项目根目录打开 PowerShell，
+不需要再次执行 `git clone`。
+
+### 2. 安装依赖
+
+可以直接安装到当前 Python 环境：
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pip check
+```
+
+也可以按第3节说明选择 Conda 或 venv 隔离环境。
+
+### 3. 创建本地配置文件
+
+```powershell
+Copy-Item benchmark.template.ini benchmark.ini
+notepad benchmark.ini
+```
+
+在 `benchmark.ini` 中完成以下配置：
+
+1. 在 `[run]` 的 `product` 中选择 `aliyun` 或 `vol`；
+2. 在 `rates` 中填写需要测试的档位，例如 `1,10,50`；
+3. 阿里云在 `[product.aliyun]` 填写 `api_key`，并检查 API URL、Domain 和模板；
+4. 字节在 `[product.vol]` 填写火山 AK、SK、Region 和 veFaaS Function ID。
+
+真实密钥只填写在本地 `benchmark.ini` 中。该文件已被 `.gitignore` 忽略，
+不要强制提交到 GitHub。
+
+### 4. 预览测试计划
+
+```powershell
+python benchmark.py run-config --config benchmark.ini
+```
+
+这条命令只显示产品、档位、持续时间和预计创建数量，不会创建沙箱，也不会
+产生云资源费用。
+
+### 5. 正式运行
+
+确认计划和费用风险后执行：
+
+```powershell
+python benchmark.py run-config --config benchmark.ini --confirm
+```
+
+测试结束后，结果位于相对路径 `results`。每次正式运行都会创建一个包含时间和
+产品名的新目录，例如：
+
+```text
+results/20260804_120000_123_阿里云_启动并发速度_无挂载_1-10-50tps_持续60s/
+```
+
+重复执行正式运行命令不会覆盖之前的测试目录：
+
+- `results/全局测试历史.csv` 追加本次结果，保留全部历史；
+- `results/全局测试结果.csv` 保留各厂商、档位的最新结果矩阵，同一测试项以
+  最新一次结果更新；
+- 每次运行的原始明细、汇总和失败日志仍保存在各自的时间戳目录中。
+
+---
+
+## 0. 推荐方式：通过一个配置文件选择产品和规模
+
+首次使用时复制模板：
+
+```powershell
+Copy-Item benchmark.template.ini benchmark.ini
+```
+
+`benchmark.ini` 是本地运行配置，已经被 `.gitignore` 忽略，可以在里面切换产品、
+选择TPS档位并填写本机密钥。主要配置如下：
+
+```ini
+[run]
+product = aliyun
+rates = 1,10,50
+duration_seconds = 60
+storages = none
+max_workers = 1000
+output = results
+exclude_first_from_mean = true
+```
+
+产品选择：
+
+```ini
+product = aliyun
+```
+
+或：
+
+```ini
+product = vol
+```
+
+只测一个档位可以填写：
+
+```ini
+rates = 50
+```
+
+测试多个档位可以填写：
+
+```ini
+rates = 1,10,50,100,200
+```
+
+配置完成后，先检查计划而不创建沙箱：
+
+```powershell
+python benchmark.py run-config --config benchmark.ini
+```
+
+确认数量和产品无误后正式运行：
+
+```powershell
+python benchmark.py run-config --config benchmark.ini --confirm
+```
+
+`benchmark.template.ini` 已包含两种驱动的配置模板。阿里云使用 E2B API Key；
+字节使用火山原生 SDK 的 AK、SK、Region 和 veFaaS Function ID。真实凭证只能
+填写在本地 `benchmark.ini` 或对应环境变量中，不能提交到 GitHub。
+
+### 0.1 公平对比阿里云和字节
+
+`[run]` 是两家产品共用的测试条件。切换厂商时只修改 `product`，下面这些字段
+必须保持完全相同：
+
+```ini
+[run]
+rates = 1,10,50,100,200
+duration_seconds = 60
+storages = none
+max_workers = 1000
+exclude_first_from_mean = true
+```
+
+先测试阿里云：
+
+```ini
+product = aliyun
+```
+
+```powershell
+python benchmark.py run-config --config benchmark.ini
+python benchmark.py run-config --config benchmark.ini --confirm
+```
+
+阿里云测试完成并确认资源已经释放后，只把产品改为字节：
+
+```ini
+product = vol
+```
+
+再次运行相同命令：
+
+```powershell
+python benchmark.py run-config --config benchmark.ini
+python benchmark.py run-config --config benchmark.ini --confirm
+```
+
+两次运行使用完全相同的 TPS、持续时间、线程上限和均值口径。阿里云通过 E2B
+创建并执行两条命令，字节通过原生 `CreateSandbox` 创建并轮询
+`DescribeSandbox` 到 Ready。两者的发压方式和统计方法相同，但“功能就绪”的
+判定接口不同，报告中应同时保留 `driver` 字段和第11节的里程碑定义。
+
+`max_workers` 不是某个厂商独有的配置。脚本对阿里云和字节使用同一个值，并按
+当前档位计算：
+
+```text
+effective_max_workers = min(max_workers, rates × duration_seconds)
+```
+
+例如 `max_workers = 1000`、持续60秒时，1/10/50/100/200 TPS 的实际线程上限
+分别是60、600、1000、1000、1000。判断线程是否足够，应查看结果中的
+`schedule_delay_p95_ms`；如果它只有几毫秒，说明本地基本按计划发出了请求。
+此时云端创建慢、HTTP 429、实例/副本配额不足或服务端错误不能通过增加本地
+线程解决，应向对应厂商申请更高配额或排查服务端错误。
+
 ---
 
 ## 1. 测试前需要准备什么
@@ -28,7 +241,7 @@ Function Compute 云沙箱。它不会在本机部署云沙箱服务端。
 
 - Windows PowerShell；
 - Python 3.10 或更高版本；
-- 能访问阿里云云沙箱 Endpoint 的网络。
+- 能访问所测厂商云沙箱 Endpoint 的网络。
 
 Conda 不是必需的。可以直接使用已有 Python 环境，也可以选择 Conda 或
 Python 自带的 venv 隔离依赖。
@@ -51,6 +264,121 @@ python --version
 
 第一部分“无挂载”测试不需要 OSS、NAS、VPC、AccessKey ID 或 AccessKey
 Secret。OSS/NAS 测试需要额外的阿里云存储、角色和网络资源，见后文。
+
+### 1.3 字节/火山引擎原生配置
+
+字节无挂载测试需要准备：
+
+1. 火山引擎 Access Key ID（AK）；
+2. 火山引擎 Secret Access Key（SK）；
+3. veFaaS 沙箱所在地域，例如 `cn-beijing`；
+4. 已创建并发布、允许创建预热实例的 veFaaS 沙箱应用 Function ID；
+5. 足够的实例/副本配额、OpenAPI 流控额度和费用预算。
+
+配置示例：
+
+```ini
+[product.vol]
+name = 字节
+driver = volcengine_native
+access_key = 这里填AK
+secret_key = 这里填SK
+region = cn-beijing
+function_id = 这里填veFaaS沙箱应用ID
+sandbox_lifetime = 6
+sandbox_lifetime_unit = minute
+ready_timeout_seconds = 120
+poll_interval_seconds = 0.1
+sdk_auto_retry = false
+endpoint =
+```
+
+其中 `endpoint` 通常留空，让 SDK 根据地域选择官方 Endpoint。只有火山项目方
+明确提供自定义 Endpoint 时才填写。`sdk_auto_retry = false` 表示压测中的一个
+trial 对应一次 CreateSandbox 调用，避免 SDK 隐式重试改变请求数口径。
+
+#### 1.3.1 火山原生单档连通性测试
+
+正式压测前，先设置每秒创建1个、持续2秒：
+
+```ini
+[run]
+product = vol
+rates = 1
+duration_seconds = 2
+storages = none
+max_workers = 1000
+output = results
+exclude_first_from_mean = true
+```
+
+先预览，确认总共创建2个 Sandbox：
+
+```powershell
+python benchmark.py run-config --config benchmark.ini
+```
+
+确认凭证、配额和费用后正式运行：
+
+```powershell
+python benchmark.py run-config --config benchmark.ini --confirm
+```
+
+成功时应看到：
+
+```text
+api_success_rate_pct = 100
+ready_success_rate_pct = 100
+cleanup_success_rate_pct = 100
+```
+
+如果延迟指标全部为 `null`，表示没有成功创建任何 Sandbox。此时应直接查看本次
+结果目录中的 `失败日志.txt`：
+
+```text
+InvalidAccessKey       → AK 无效、停用或抄写错误
+SignatureDoesNotMatch  → SK 错误、AK/SK 不配对或字符大小写错误
+AccessDenied           → 当前用户缺少 veFaaS 权限
+资源不存在类错误       → Region 或 Function ID 不正确
+```
+
+AK/SK 区分大小写，必须从火山控制台复制同一对原始值，不要通过截图或 OCR
+转录。如果使用临时凭证，还需要额外配置 Session Token；当前模板默认用于长期
+AK/SK。
+
+#### 1.3.2 火山原生正式压测
+
+单档测试成功后，再设置正式档位：
+
+```ini
+[run]
+product = vol
+rates = 1,10,50,100,200
+duration_seconds = 60
+storages = none
+max_workers = 1000
+output = results
+exclude_first_from_mean = true
+```
+
+然后执行：
+
+```powershell
+python benchmark.py run-config --config benchmark.ini
+python benchmark.py run-config --config benchmark.ini --confirm
+```
+
+每个 trial 的原生生命周期为：
+
+```text
+CreateSandbox
+→ DescribeSandbox 轮询到第一次 Ready
+→ DescribeSandbox 第二次确认 Ready
+→ KillSandbox 清理实例
+```
+
+程序使用和其他产品相同的 TPS 调度、线程上限、持续时间、成功率、百分位、CSV、
+失败日志和全局结果矩阵。火山原生测试当前只支持 `storages = none`。
 
 ---
 
@@ -75,6 +403,7 @@ Get-ChildItem
 
 ```text
 benchmark.py
+benchmark.template.ini
 environment.yml
 requirements.txt
 env.template.txt
@@ -115,7 +444,25 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 3.3 依赖版本
+### 3.3 方式C：使用 Conda（可选）
+
+已经安装 Anaconda 或 Miniconda 的用户，可以创建名为 `aliyun` 的独立环境：
+
+```powershell
+conda create -n aliyun python=3.11 -y
+conda activate aliyun
+python -m pip install -r requirements.txt
+```
+
+以后重新打开 PowerShell 运行本项目时，只需要先进入仓库根目录并激活环境：
+
+```powershell
+conda activate aliyun
+```
+
+Conda 只是可选的依赖隔离方式，不影响阿里云或字节产品的选择。
+
+### 3.4 依赖版本
 
 当前项目固定使用：
 
@@ -123,13 +470,14 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 e2b==2.31.0
 e2b-code-interpreter==2.8.1
 python-dotenv==1.2.2
+volcengine-python-sdk==5.0.31
 ```
 
-### 3.4 检查当前环境
+### 3.5 检查当前环境
 
 ```powershell
 python --version
-python -m pip show e2b e2b-code-interpreter python-dotenv
+python -m pip show e2b e2b-code-interpreter python-dotenv volcengine-python-sdk
 python -m pip check
 ```
 
@@ -150,10 +498,15 @@ No broken requirements found.
 
 ---
 
-## 4. 创建并填写 .env
+## 4. 可选方式：创建并填写 .env
 
-程序读取的是 `.env`。GitHub 中保存的是不含真实密钥的普通文本模板
-`env.template.txt`。
+如果使用前面的 `run-config --config benchmark.ini` 配置模式，并已在对应产品段
+填写所需凭证，可以跳过本节，不需要创建 `.env`。火山原生驱动也不读取这里的
+E2B 变量。
+
+直接使用 `smoke`、`plan`、`run` 等传统命令时，程序从 `.env` 读取连接参数。
+GitHub 中保存的是不含真实密钥的普通文本模板 `env.template.txt`。配置模式也
+可以将 `api_key` 留空，再通过 `api_key_env` 指定的环境变量读取密钥。
 
 如果还没有 `.env`，执行：
 
@@ -430,9 +783,8 @@ schedule_delay_p95_ms
 
 ## 10. 结果目录和文件
 
-脚本使用 `--provider` 指定厂商目录，默认值是 `aliyun`。这个参数负责结果归类，
-不会自动切换 SDK、API 地址或厂商实现。以后接入其他厂商时，应在对应实现和
-环境变量都配置正确后再使用相应标识，例如 `vol` 或 `ags`。
+配置模式使用 `[run]` 中的 `product` 选择产品，并从对应的
+`[product.aliyun]` 或 `[product.vol]` 读取SDK连接参数。
 
 每次测试会按照“测试内容 + 存储类型 + 档位 + 持续时间 + 时间戳”生成独立
 目录。例如：
@@ -441,14 +793,15 @@ schedule_delay_p95_ms
 results/
 ├── 全局测试结果.csv
 ├── 全局测试历史.csv
-└── aliyun/
-    └── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123/
-        ├── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_原始明细.csv
-        ├── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_汇总.csv
-        ├── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_汇总.json
-        ├── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_失败日志.csv
-        └── 启动并发速度_无挂载_50tps_持续60s_20260803_120000_123_失败日志.txt
+└── 20260804_120000_123_阿里云_启动并发速度_无挂载_50tps_持续60s/
+    ├── 20260804_120000_123_阿里云_..._原始明细.csv
+    ├── 20260804_120000_123_阿里云_..._汇总.csv
+    ├── 20260804_120000_123_阿里云_..._汇总.json
+    ├── 20260804_120000_123_阿里云_..._失败日志.csv
+    └── 20260804_120000_123_阿里云_..._失败日志.txt
 ```
+
+如果配置 `product = vol`，目录名中的产品名称会自动变为“字节”。
 
 各文件用途：
 
@@ -467,32 +820,31 @@ results/
 `result_directory` 可以定位到原始测试目录，同一厂商重复测试同一档位不会覆盖。
 
 随后脚本会根据历史表重建 `results/全局测试结果.csv`。矩阵每行由
-`test_name + provider + storage + duration_seconds + metric` 唯一确定，各档位分别
+`test_name + provider + product_name + driver + storage + duration_seconds + metric`
+唯一确定，各档位分别
 放在 `1tps`、`10tps`、`50tps`、`100tps`、`200tps` 等列中。例如：
 
 ```text
-test_name,provider,storage,duration_seconds,metric,unit,1tps,10tps,50tps
-启动并发速度,aliyun,none,60,api_latency_p50_ms,ms,420.1,510.2,890.4
-启动并发速度,vol,none,60,api_latency_p50_ms,ms,380.3,470.5,760.8
-启动并发速度,ags,none,60,api_latency_p50_ms,ms,401.6,488.9,801.2
+test_name,provider,product_name,driver,storage,duration_seconds,metric,unit,1tps,10tps,50tps
+启动并发速度,aliyun,阿里云,e2b,none,60,api_latency_p50_ms,ms,420.1,510.2,890.4
+启动并发速度,vol,字节,volcengine_native,none,60,api_latency_p50_ms,ms,380.3,470.5,760.8
 ```
 
 同一厂商、存储、持续时间和指标重复测试同一TPS时，矩阵采用最后一次测试值；
 旧值仍完整保留在历史表中。只运行一个档位时，其他已测档位不会丢失。
 `smoke` 连通性测试不会写入这两个全局表。
 
-厂商归档示例：
+配置产品示例：
 
-```powershell
-# 阿里云（默认值，--provider aliyun 可以省略）
-python benchmark.py run --provider aliyun --rates 50 --duration-seconds 60 --storages none --confirm
+```ini
+# 阿里云
+product = aliyun
 
-# 未来接入火山引擎实现后
-python benchmark.py run --provider vol --rates 50 --duration-seconds 60 --storages none --confirm
-
-# 未来接入 AGS 兼容实现后
-python benchmark.py run --provider ags --rates 50 --duration-seconds 60 --storages none --confirm
+# 字节
+product = vol
 ```
+
+修改后统一运行 `python benchmark.py run-config --config benchmark.ini --confirm`。
 
 即使本轮没有失败，也会生成失败日志：
 
@@ -508,6 +860,8 @@ python benchmark.py run --provider ags --rates 50 --duration-seconds 60 --storag
 | 指标 | 含义 |
 |---|---|
 | `provider` | 厂商标识，例如 `aliyun`、`vol`、`ags` |
+| `product_name` | 结果目录和表格使用的产品名称，例如“阿里云”“字节” |
+| `driver` | 调用驱动；阿里云为 `e2b`，字节原生为 `volcengine_native` |
 | `storage` | 存储场景，`none` 表示无挂载 |
 | `target_rate_per_s` | 目标启动速率，单位为次/秒 |
 | `rate_label` | 便于制作对比矩阵的档位标签，例如 `1tps`、`10tps`、`50tps` |
@@ -515,18 +869,20 @@ python benchmark.py run --provider ags --rates 50 --duration-seconds 60 --storag
 | `configured_max_workers` | 命令配置的线程上限，默认1000 |
 | `effective_max_workers` | 当前档位实际建立的最大线程数，不超过请求总数 |
 | `attempts` | 计划并实际安排的请求数量 |
+| `mean_excludes_first_trial` | 是否将当前TPS档位的第1个沙箱排除在mean之外 |
+| `*_mean_sample_count` | 对应mean实际使用的有效样本数 |
 
 ### 11.2 成功率
 
 | 指标 | 含义 |
 |---|---|
-| `api_success_rate_pct` | `Sandbox.create()` 成功返回的比例 |
-| `ready_success_rate_pct` | 第一条和第二条命令都成功执行的比例 |
-| `cleanup_success_rate_pct` | 成功执行 `sandbox.kill()` 释放资源的比例 |
+| `api_success_rate_pct` | 创建 API 成功返回且取得 Sandbox ID 的比例 |
+| `ready_success_rate_pct` | E2B 两条命令均成功，或火山原生连续两次查询均为 Ready 的比例 |
+| `cleanup_success_rate_pct` | E2B `sandbox.kill()` 或火山原生 `KillSandbox` 成功的比例 |
 
 ### 11.3 三段延迟
 
-时间点定义：
+阿里云 E2B 驱动的时间点定义：
 
 ```text
 T0：开始调用 Sandbox.create()
@@ -546,6 +902,30 @@ second_command_latency = T3 - T0
 三项都是以 `Sandbox.create()` 开始调用的 T0 为起点，因此在同一个成功样本中
 应满足：`api_latency <= first_command_latency <= second_command_latency`。
 第一条和第二条命令延迟现在都是累计就绪时间，不再是相邻阶段自身的耗时。
+
+字节/火山原生驱动通过状态查询判断就绪。为复用同一套 CSV、统计和全局矩阵，
+字段名称保持不变，但里程碑定义为：
+
+```text
+T0：开始调用原生 CreateSandbox
+T1：CreateSandbox 返回 Sandbox ID
+T2：DescribeSandbox 第一次返回 Ready
+T3：紧接着再次调用 DescribeSandbox，第二次确认 Ready
+
+api_latency = T1 - T0
+first_command_latency = T2 - T0   （原生驱动实际表示首次 Ready）
+second_command_latency = T3 - T0  （原生驱动实际表示二次 Ready 确认）
+```
+
+火山原生模式不会为了填充这两个字段而执行沙箱内部命令。原始明细中的
+`ready_poll_count` 是 DescribeSandbox 调用次数，`last_observed_status` 是最后
+一次查询到的状态。无论使用哪种驱动，三个延迟都从同一个 T0 开始，成功样本
+应满足 `api_latency <= first_command_latency <= second_command_latency`。
+
+当配置 `exclude_first_from_mean = true` 时，每个TPS档位中 `trial_index = 1` 的
+第一条记录不参与三项延迟的 `mean`。该记录仍然保留在原始明细中，并继续参与
+`min`、`max`、P50、P90、P95、P99以及成功率统计。若某档只有1次有效请求，排除
+后该档的mean为空，同时 `*_mean_sample_count` 为0。
 
 三段延迟都输出：
 
@@ -591,7 +971,9 @@ Excel 指标字典：
 | `api_create` | 创建 Sandbox 失败 |
 | `first_command` | 第一条命令失败 |
 | `second_command` | 第二条命令失败 |
-| 清理错误字段 | `sandbox.kill()` 失败 |
+| `ready_poll` | 火山原生 DescribeSandbox 等待 Ready 失败或超时 |
+| `ready_confirm` | 火山原生第二次 Ready 确认失败 |
+| 清理错误字段 | E2B `sandbox.kill()` 或火山原生 `KillSandbox` 失败 |
 
 重点字段：
 
@@ -609,6 +991,8 @@ error_traceback
 cleanup_error_type
 cleanup_error_message
 cleanup_error_traceback
+ready_poll_count
+last_observed_status
 ```
 
 提交阿里云工单时，可以提供失败时间、Sandbox ID、错误类型和错误信息，但
@@ -618,24 +1002,40 @@ cleanup_error_traceback
 
 ## 13. 推荐执行顺序
 
-完整流程：
+下面的流程同时适用于阿里云和字节/火山。首次下载后先安装依赖并复制配置模板：
 
 ```powershell
 # 以下命令均在仓库根目录执行
 python -m pip install -r requirements.txt
 python -m pip check
-python benchmark.py smoke --storage none
-python benchmark.py plan --rates 1 --duration-seconds 60 --storages none
-python benchmark.py run --rates 1 --duration-seconds 60 --storages none --confirm
-python benchmark.py plan --rates 10 --duration-seconds 60 --storages none
-python benchmark.py run --rates 10 --duration-seconds 60 --storages none --confirm
-python benchmark.py plan --rates 50 --duration-seconds 60 --storages none
-python benchmark.py run --rates 50 --duration-seconds 60 --storages none --confirm
-python benchmark.py plan --rates 100 --duration-seconds 60 --storages none
-python benchmark.py run --rates 100 --duration-seconds 60 --storages none --confirm
-python benchmark.py plan --rates 200 --duration-seconds 60 --storages none
-python benchmark.py run --rates 200 --duration-seconds 60 --storages none --confirm
+Copy-Item benchmark.template.ini benchmark.ini
+notepad benchmark.ini
 ```
+
+在 `benchmark.ini` 中选择 `product`，填写对应厂商凭证，并设置共同的测试规模：
+
+```ini
+[run]
+product = aliyun
+rates = 1,10,50,100,200
+duration_seconds = 60
+storages = none
+max_workers = 1000
+output = results
+exclude_first_from_mean = true
+```
+
+建议先把 `rates = 1`、`duration_seconds = 2` 做小规模连通性验证。先预览，确认
+产品、档位和预计请求数无误后再正式执行：
+
+```powershell
+python benchmark.py run-config --config benchmark.ini
+python benchmark.py run-config --config benchmark.ini --confirm
+```
+
+小规模测试成功后，再改回正式档位并重复上述两条命令。测试阿里云时设置
+`product = aliyun`，测试字节/火山时只改为 `product = vol`；公平对比时不要改变
+`rates`、`duration_seconds`、`max_workers` 和 `exclude_first_from_mean`。
 
 如果选择了 Conda，应在上述命令前先执行：
 
@@ -658,7 +1058,7 @@ conda activate aliyun
 3. `cleanup_success_rate_pct`；
 4. `schedule_delay_p95_ms`；
 5. `失败日志.csv` 和 `失败日志.txt`；
-6. 阿里云控制台中是否仍有未释放 Sandbox。
+6. 对应厂商控制台中是否仍有未释放 Sandbox。
 
 ---
 

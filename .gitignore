@@ -1,5 +1,6 @@
 .env
 .env.example
+benchmark.ini
 .venv/
 results/
 __pycache__/

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import csv
 import json
 import math
@@ -15,7 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from dotenv import load_dotenv
 from e2b_code_interpreter import Sandbox
@@ -24,11 +25,18 @@ from e2b_code_interpreter import Sandbox
 STORAGE_CHOICES = ("none", "oss", "file")
 DEFAULT_PROVIDER = "aliyun"
 DEFAULT_MAX_WORKERS = 1000
+DEFAULT_PRODUCT_NAMES = {
+    "aliyun": "阿里云",
+    "vol": "字节",
+    "byte": "字节",
+    "ags": "AGS",
+}
 PRINT_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
-class Settings:
+class E2BSettings:
+    driver: str
     api_key: str
     api_url: str
     domain: str
@@ -42,9 +50,29 @@ class Settings:
     extra_metadata: dict[str, str]
 
 
+@dataclass(frozen=True)
+class VolcengineNativeSettings:
+    driver: str
+    access_key: str
+    secret_key: str
+    region: str
+    function_id: str
+    sandbox_lifetime: int
+    sandbox_lifetime_unit: str
+    ready_timeout_seconds: float
+    poll_interval_seconds: float
+    sdk_auto_retry: bool
+    endpoint: str
+
+
+Settings = E2BSettings | VolcengineNativeSettings
+
+
 @dataclass
 class TrialResult:
     provider: str
+    product_name: str
+    driver: str
     storage: str
     target_rate_per_s: int
     duration_seconds: float
@@ -67,18 +95,37 @@ class TrialResult:
     cleanup_error_type: str
     cleanup_error_message: str
     cleanup_error_traceback: str
+    ready_poll_count: int
+    last_observed_status: str
+
+
+@dataclass(frozen=True)
+class ConfiguredRun:
+    provider: str
+    product_name: str
+    rates: list[int]
+    duration_seconds: float
+    storages: list[str]
+    max_workers: int
+    output: Path
+    exclude_first_from_mean: bool
+    settings: Settings
 
 
 def env_json(name: str) -> dict | None:
     raw = os.environ.get(name, "").strip()
     if not raw:
         return None
+    return parse_json_object(raw, name)
+
+
+def parse_json_object(raw: str, label: str) -> dict:
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"{name} 不是合法 JSON: {exc}") from exc
+        raise RuntimeError(f"{label} 不是合法 JSON: {exc}") from exc
     if not isinstance(value, dict):
-        raise RuntimeError(f"{name} 必须是 JSON 对象")
+        raise RuntimeError(f"{label} 必须是 JSON 对象")
     return value
 
 
@@ -89,13 +136,14 @@ def require_env(name: str) -> str:
     return value
 
 
-def load_settings(require_credentials: bool = True) -> Settings:
+def load_settings(require_credentials: bool = True) -> E2BSettings:
     load_dotenv()
     extra = env_json("E2B_EXTRA_METADATA_JSON") or {}
     if not all(isinstance(k, str) and isinstance(v, str) for k, v in extra.items()):
         raise RuntimeError("E2B_EXTRA_METADATA_JSON 的键和值都必须是字符串")
 
-    return Settings(
+    return E2BSettings(
+        driver="e2b",
         api_key=require_env("E2B_API_KEY") if require_credentials else "",
         api_url=require_env("E2B_API_URL") if require_credentials else "",
         domain=require_env("E2B_DOMAIN") if require_credentials else "",
@@ -111,7 +159,205 @@ def load_settings(require_credentials: bool = True) -> Settings:
     )
 
 
+def config_json(
+    section: configparser.SectionProxy,
+    option: str,
+) -> dict | None:
+    raw = section.get(option, "").strip()
+    return parse_json_object(raw, option) if raw else None
+
+
+def required_config_value(
+    section: configparser.SectionProxy,
+    option: str,
+) -> str:
+    value = section.get(option, "").strip()
+    if not value:
+        raise RuntimeError(f"配置段 [{section.name}] 缺少 {option}")
+    return value
+
+
+def config_secret(
+    section: configparser.SectionProxy,
+    option: str,
+    env_option: str,
+) -> str:
+    value = section.get(option, "").strip()
+    env_name = section.get(env_option, "").strip()
+    if not value and env_name:
+        value = os.environ.get(env_name, "").strip()
+    if not value or value.upper().startswith(("REPLACE_", "YOUR_")):
+        source = f" 或环境变量 {env_name}" if env_name else ""
+        raise RuntimeError(f"[{section.name}] 缺少有效的 {option}{source}")
+    return value
+
+
+def load_configured_run(path: Path) -> ConfiguredRun:
+    load_dotenv()
+    if not path.exists():
+        raise RuntimeError(
+            f"找不到配置文件: {path}；请先复制 benchmark.template.ini 为 benchmark.ini"
+        )
+
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (configparser.Error, OSError) as exc:
+        raise RuntimeError(f"读取配置文件失败: {exc}") from exc
+
+    if "run" not in parser:
+        raise RuntimeError("配置文件缺少 [run] 段")
+    run_section = parser["run"]
+    try:
+        provider = parse_provider(required_config_value(run_section, "product"))
+        rates = parse_csv_ints(required_config_value(run_section, "rates"))
+        storages = parse_storages(run_section.get("storages", "none"))
+    except argparse.ArgumentTypeError as exc:
+        raise RuntimeError(f"配置文件参数错误: {exc}") from exc
+
+    profile_name = f"product.{provider}"
+    if profile_name not in parser:
+        raise RuntimeError(f"配置文件缺少 [{profile_name}] 产品段")
+    product = parser[profile_name]
+    product_name = product.get("name", provider).strip() or provider
+
+    duration_seconds = run_section.getfloat("duration_seconds", fallback=60.0)
+    max_workers = run_section.getint("max_workers", fallback=DEFAULT_MAX_WORKERS)
+    exclude_first = run_section.getboolean(
+        "exclude_first_from_mean",
+        fallback=True,
+    )
+    if duration_seconds <= 0:
+        raise RuntimeError("[run] duration_seconds 必须大于 0")
+    if max_workers <= 0:
+        raise RuntimeError("[run] max_workers 必须大于 0")
+
+    driver = product.get("driver", "e2b").strip().lower() or "e2b"
+    if driver == "e2b":
+        extra_metadata = config_json(product, "extra_metadata_json") or {}
+        if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in extra_metadata.items()
+        ):
+            raise RuntimeError(
+                f"[{profile_name}] extra_metadata_json 的键和值必须是字符串"
+            )
+        settings: Settings = E2BSettings(
+            driver=driver,
+            api_key=config_secret(product, "api_key", "api_key_env"),
+            api_url=required_config_value(product, "api_url"),
+            domain=required_config_value(product, "domain"),
+            template=required_config_value(product, "template"),
+            sandbox_timeout=product.getint("sandbox_timeout", fallback=300),
+            vpc_config=config_json(product, "vpc_config_json"),
+            oss_config=config_json(product, "oss_config_json"),
+            role_arn=product.get("role_arn", "").strip(),
+            file_metadata_key=product.get("file_metadata_key", "").strip(),
+            file_config=config_json(product, "file_config_json"),
+            extra_metadata=extra_metadata,
+        )
+    elif driver == "volcengine_native":
+        settings = VolcengineNativeSettings(
+            driver=driver,
+            access_key=config_secret(product, "access_key", "access_key_env"),
+            secret_key=config_secret(product, "secret_key", "secret_key_env"),
+            region=required_config_value(product, "region"),
+            function_id=required_config_value(product, "function_id"),
+            sandbox_lifetime=product.getint("sandbox_lifetime", fallback=6),
+            sandbox_lifetime_unit=(
+                product.get("sandbox_lifetime_unit", "minute").strip() or "minute"
+            ),
+            ready_timeout_seconds=product.getfloat(
+                "ready_timeout_seconds", fallback=120.0
+            ),
+            poll_interval_seconds=product.getfloat(
+                "poll_interval_seconds", fallback=0.1
+            ),
+            sdk_auto_retry=product.getboolean("sdk_auto_retry", fallback=False),
+            endpoint=product.get("endpoint", "").strip(),
+        )
+        if settings.sandbox_lifetime <= 0:
+            raise RuntimeError(f"[{profile_name}] sandbox_lifetime 必须大于 0")
+        if settings.ready_timeout_seconds <= 0:
+            raise RuntimeError(f"[{profile_name}] ready_timeout_seconds 必须大于 0")
+        if settings.poll_interval_seconds <= 0:
+            raise RuntimeError(f"[{profile_name}] poll_interval_seconds 必须大于 0")
+    else:
+        raise RuntimeError(
+            f"[{profile_name}] driver 只支持 e2b 或 volcengine_native"
+        )
+    return ConfiguredRun(
+        provider=provider,
+        product_name=product_name,
+        rates=rates,
+        duration_seconds=duration_seconds,
+        storages=storages,
+        max_workers=max_workers,
+        output=Path(run_section.get("output", "results").strip() or "results"),
+        exclude_first_from_mean=exclude_first,
+        settings=settings,
+    )
+
+
+class VolcengineNativeRuntime:
+    def __init__(self, settings: VolcengineNativeSettings, max_workers: int):
+        try:
+            import volcenginesdkcore
+            import volcenginesdkvefaas
+        except ImportError as exc:
+            raise RuntimeError(
+                "火山原生模式缺少 volcengine-python-sdk；请先执行 "
+                "python -m pip install -r requirements.txt"
+            ) from exc
+
+        configuration = volcenginesdkcore.Configuration()
+        configuration.ak = settings.access_key
+        configuration.sk = settings.secret_key
+        configuration.region = settings.region
+        configuration.auto_retry = settings.sdk_auto_retry
+        configuration.connection_pool_maxsize = max(1, max_workers)
+        if settings.endpoint:
+            configuration.host = settings.endpoint
+
+        self.sdk = volcenginesdkvefaas
+        self.api_client = volcenginesdkcore.ApiClient(configuration)
+        self.api = volcenginesdkvefaas.VEFAASApi(self.api_client)
+
+    def create(self, settings: VolcengineNativeSettings) -> Any:
+        request = self.sdk.CreateSandboxRequest(
+            function_id=settings.function_id,
+            timeout=settings.sandbox_lifetime,
+            timeout_unit=settings.sandbox_lifetime_unit,
+        )
+        return self.api.create_sandbox(request)
+
+    def describe(self, settings: VolcengineNativeSettings, sandbox_id: str) -> Any:
+        request = self.sdk.DescribeSandboxRequest(
+            function_id=settings.function_id,
+            sandbox_id=sandbox_id,
+        )
+        return self.api.describe_sandbox(request)
+
+    def kill(self, settings: VolcengineNativeSettings, sandbox_id: str) -> None:
+        request = self.sdk.KillSandboxRequest(
+            function_id=settings.function_id,
+            sandbox_id=sandbox_id,
+        )
+        self.api.kill_sandbox(request)
+
+    def close(self) -> None:
+        close = getattr(self.api_client, "close", None)
+        if callable(close):
+            close()
+
+
 def metadata_for(storage: str, settings: Settings) -> dict[str, str]:
+    if isinstance(settings, VolcengineNativeSettings):
+        if storage != "none":
+            raise RuntimeError("火山原生 SDK 当前只支持 storages = none")
+        return {}
+
     metadata = dict(settings.extra_metadata)
     if settings.vpc_config:
         metadata["fc.sandbox.network.vpc"] = json.dumps(
@@ -140,10 +386,12 @@ def metadata_for(storage: str, settings: Settings) -> dict[str, str]:
     return metadata
 
 
-def one_trial(
+def one_trial_volcengine_native(
     *,
-    settings: Settings,
+    settings: VolcengineNativeSettings,
+    runtime: VolcengineNativeRuntime,
     provider: str,
+    product_name: str,
     storage: str,
     rate: int,
     duration_seconds: float,
@@ -153,6 +401,219 @@ def one_trial(
     scheduled_monotonic: float,
     scheduled_at_utc: str,
 ) -> TrialResult:
+    sandbox_id = ""
+    api_latency_ms = None
+    first_command_latency_ms = None
+    second_command_latency_ms = None
+    api_success = False
+    ready_success = False
+    cleanup_success = True
+    failure_phase = ""
+    error_type = ""
+    error_message = ""
+    error_traceback = ""
+    cleanup_error_type = ""
+    cleanup_error_message = ""
+    cleanup_error_traceback = ""
+    ready_poll_count = 0
+    last_observed_status = ""
+
+    actual_start = time.perf_counter()
+    queue_delay_ms = max(0.0, (actual_start - scheduled_monotonic) * 1000)
+    create_start = time.perf_counter()
+    current_phase = "api_create"
+    last_describe_error = ""
+
+    try:
+        create_response = runtime.create(settings)
+        api_return = time.perf_counter()
+        api_latency_ms = (api_return - create_start) * 1000
+        sandbox_id = str(
+            getattr(
+                create_response,
+                "sandbox_id",
+                getattr(create_response, "id", ""),
+            )
+            or ""
+        )
+        if not sandbox_id:
+            raise RuntimeError("CreateSandbox 返回成功但没有 Sandbox ID")
+        api_success = True
+
+        current_phase = "ready_poll"
+        deadline = create_start + settings.ready_timeout_seconds
+        while time.perf_counter() <= deadline:
+            try:
+                describe_response = runtime.describe(settings, sandbox_id)
+                ready_poll_count += 1
+                status = getattr(
+                    describe_response,
+                    "status",
+                    getattr(describe_response, "state", None),
+                )
+                last_observed_status = str(status or "")
+                normalized_status = last_observed_status.strip().lower()
+            except Exception as exc:
+                ready_poll_count += 1
+                last_describe_error = (
+                    f"{type(exc).__name__}: {str(exc)}"
+                    .replace("\r", " ")
+                    .replace("\n", " ")[:1000]
+                )
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                time.sleep(min(settings.poll_interval_seconds, remaining))
+                continue
+
+            if normalized_status == "ready":
+                first_ready = time.perf_counter()
+                first_command_latency_ms = (first_ready - create_start) * 1000
+
+                current_phase = "ready_confirm"
+                confirm_response = runtime.describe(settings, sandbox_id)
+                ready_poll_count += 1
+                confirm_status = getattr(
+                    confirm_response,
+                    "status",
+                    getattr(confirm_response, "state", None),
+                )
+                last_observed_status = str(confirm_status or "")
+                second_ready = time.perf_counter()
+                second_command_latency_ms = (second_ready - create_start) * 1000
+                if last_observed_status.strip().lower() == "ready":
+                    ready_success = True
+                else:
+                    failure_phase = "ready_confirm"
+                    error_type = "ReadyConfirmationFailed"
+                    error_message = (
+                        "首次查询为 Ready，但第二次查询状态为 "
+                        f"{last_observed_status or '(空)'}"
+                    )
+                break
+
+            if normalized_status in {"failed", "error"}:
+                failure_phase = "ready_poll"
+                error_type = "SandboxTerminalState"
+                remote_code = str(getattr(describe_response, "error_code", "") or "")
+                remote_message = str(
+                    getattr(describe_response, "error_message", "") or ""
+                )
+                error_message = (
+                    f"Sandbox 进入终止状态 {last_observed_status}; "
+                    f"error_code={remote_code or '(空)'}; "
+                    f"error_message={remote_message or '(空)'}"
+                )[:1000]
+                break
+
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            time.sleep(min(settings.poll_interval_seconds, remaining))
+
+        if not ready_success and not error_type:
+            failure_phase = "ready_poll"
+            error_type = "ReadyTimeout"
+            error_message = (
+                f"从 CreateSandbox 开始超过 {settings.ready_timeout_seconds:g} 秒"
+                f"仍未 Ready；最后状态={last_observed_status or '(空)'}"
+            )
+            if last_describe_error:
+                error_message += f"；最后查询异常={last_describe_error}"
+            error_message = error_message[:1000]
+    except Exception as exc:
+        failure_phase = current_phase
+        error_type = type(exc).__name__
+        error_message = str(exc).replace("\r", " ").replace("\n", " ")[:1000]
+        error_traceback = traceback.format_exc()
+    finally:
+        if sandbox_id:
+            try:
+                runtime.kill(settings, sandbox_id)
+            except Exception as exc:
+                cleanup_success = False
+                cleanup_error_type = type(exc).__name__
+                cleanup_error_message = (
+                    str(exc).replace("\r", " ").replace("\n", " ")[:1000]
+                )
+                cleanup_error_traceback = traceback.format_exc()
+
+    return TrialResult(
+        provider=provider,
+        product_name=product_name,
+        driver=settings.driver,
+        storage=storage,
+        target_rate_per_s=rate,
+        duration_seconds=(
+            int(duration_seconds)
+            if float(duration_seconds).is_integer()
+            else duration_seconds
+        ),
+        configured_max_workers=configured_max_workers,
+        effective_max_workers=effective_max_workers,
+        trial_index=trial_index,
+        scheduled_at_utc=scheduled_at_utc,
+        queue_delay_ms=round(queue_delay_ms, 3),
+        api_latency_ms=round(api_latency_ms, 3) if api_latency_ms is not None else None,
+        first_command_latency_ms=(
+            round(first_command_latency_ms, 3)
+            if first_command_latency_ms is not None
+            else None
+        ),
+        second_command_latency_ms=(
+            round(second_command_latency_ms, 3)
+            if second_command_latency_ms is not None
+            else None
+        ),
+        api_success=api_success,
+        ready_success=ready_success,
+        cleanup_success=cleanup_success,
+        sandbox_id=sandbox_id,
+        failure_phase=failure_phase,
+        error_type=error_type,
+        error_message=error_message,
+        error_traceback=error_traceback,
+        cleanup_error_type=cleanup_error_type,
+        cleanup_error_message=cleanup_error_message,
+        cleanup_error_traceback=cleanup_error_traceback,
+        ready_poll_count=ready_poll_count,
+        last_observed_status=last_observed_status,
+    )
+
+
+def one_trial(
+    *,
+    settings: Settings,
+    provider: str,
+    product_name: str,
+    storage: str,
+    rate: int,
+    duration_seconds: float,
+    configured_max_workers: int,
+    effective_max_workers: int,
+    trial_index: int,
+    scheduled_monotonic: float,
+    scheduled_at_utc: str,
+    native_runtime: VolcengineNativeRuntime | None = None,
+) -> TrialResult:
+    if isinstance(settings, VolcengineNativeSettings):
+        if native_runtime is None:
+            raise RuntimeError("火山原生模式缺少已初始化的 SDK 客户端")
+        return one_trial_volcengine_native(
+            settings=settings,
+            runtime=native_runtime,
+            provider=provider,
+            product_name=product_name,
+            storage=storage,
+            rate=rate,
+            duration_seconds=duration_seconds,
+            configured_max_workers=configured_max_workers,
+            effective_max_workers=effective_max_workers,
+            trial_index=trial_index,
+            scheduled_monotonic=scheduled_monotonic,
+            scheduled_at_utc=scheduled_at_utc,
+        )
+
     sandbox = None
     cleanup_success = True
     sandbox_id = ""
@@ -192,13 +653,13 @@ def one_trial(
 
         current_phase = "first_command"
         first_result = sandbox.commands.run(
-            "python3 -c \"print('ALIYUN_SANDBOX_FIRST_COMMAND')\"",
+            "python3 -c \"print('SANDBOX_FIRST_COMMAND')\"",
             timeout=30,
         )
         first_command_ready = time.perf_counter()
         first_command_latency_ms = (first_command_ready - create_start) * 1000
         first_stdout = getattr(first_result, "stdout", "") or ""
-        first_command_success = "ALIYUN_SANDBOX_FIRST_COMMAND" in first_stdout
+        first_command_success = "SANDBOX_FIRST_COMMAND" in first_stdout
         if not first_command_success:
             failure_phase = "first_command"
             error_type = "FirstCommandCheckFailed"
@@ -206,13 +667,13 @@ def one_trial(
         else:
             current_phase = "second_command"
             second_result = sandbox.commands.run(
-                "python3 -c \"print('ALIYUN_SANDBOX_SECOND_COMMAND')\"",
+                "python3 -c \"print('SANDBOX_SECOND_COMMAND')\"",
                 timeout=30,
             )
             second_command_ready = time.perf_counter()
             second_command_latency_ms = (second_command_ready - create_start) * 1000
             second_stdout = getattr(second_result, "stdout", "") or ""
-            ready_success = "ALIYUN_SANDBOX_SECOND_COMMAND" in second_stdout
+            ready_success = "SANDBOX_SECOND_COMMAND" in second_stdout
             if not ready_success:
                 failure_phase = "second_command"
                 error_type = "SecondCommandCheckFailed"
@@ -239,6 +700,8 @@ def one_trial(
 
     return TrialResult(
         provider=provider,
+        product_name=product_name,
+        driver=settings.driver,
         storage=storage,
         target_rate_per_s=rate,
         duration_seconds=(
@@ -273,16 +736,20 @@ def one_trial(
         cleanup_error_type=cleanup_error_type,
         cleanup_error_message=cleanup_error_message,
         cleanup_error_traceback=cleanup_error_traceback,
+        ready_poll_count=0,
+        last_observed_status="commands_ready" if ready_success else "",
     )
 
 
 def run_rate(
     settings: Settings,
     provider: str,
+    product_name: str,
     storage: str,
     rate: int,
     duration_seconds: float,
     max_workers: int,
+    native_runtime: VolcengineNativeRuntime | None = None,
 ) -> list[TrialResult]:
     attempts = max(1, math.ceil(rate * duration_seconds))
     effective_max_workers = min(max_workers, attempts)
@@ -307,6 +774,7 @@ def run_rate(
                     one_trial,
                     settings=settings,
                     provider=provider,
+                    product_name=product_name,
                     storage=storage,
                     rate=rate,
                     duration_seconds=duration_seconds,
@@ -315,6 +783,7 @@ def run_rate(
                     trial_index=index + 1,
                     scheduled_monotonic=scheduled,
                     scheduled_at_utc=scheduled_utc,
+                    native_runtime=native_runtime,
                 )
             )
 
@@ -340,12 +809,20 @@ def percentile(values: Iterable[float], percent: float) -> float | None:
     return round(ordered[index], 3)
 
 
-def summarize(results: list[TrialResult]) -> list[dict]:
-    groups: dict[tuple[str, str, int, float, int, int], list[TrialResult]] = {}
+def summarize(
+    results: list[TrialResult],
+    exclude_first_from_mean: bool = True,
+) -> list[dict]:
+    groups: dict[
+        tuple[str, str, str, str, int, float, int, int],
+        list[TrialResult],
+    ] = {}
     for row in results:
         groups.setdefault(
             (
                 row.provider,
+                row.product_name,
+                row.driver,
                 row.storage,
                 row.target_rate_per_s,
                 row.duration_seconds,
@@ -358,6 +835,8 @@ def summarize(results: list[TrialResult]) -> list[dict]:
     summary = []
     for (
         provider,
+        product_name,
+        driver,
         storage,
         rate,
         duration_seconds,
@@ -375,11 +854,33 @@ def summarize(results: list[TrialResult]) -> list[dict]:
             for row in rows
             if row.second_command_latency_ms is not None
         ]
+        mean_rows = [
+            row
+            for row in rows
+            if not exclude_first_from_mean or row.trial_index != 1
+        ]
+        api_mean = [
+            row.api_latency_ms
+            for row in mean_rows
+            if row.api_latency_ms is not None
+        ]
+        command_mean = [
+            row.first_command_latency_ms
+            for row in mean_rows
+            if row.first_command_latency_ms is not None
+        ]
+        second_command_mean = [
+            row.second_command_latency_ms
+            for row in mean_rows
+            if row.second_command_latency_ms is not None
+        ]
         queue = [row.queue_delay_ms for row in rows]
         attempts = len(rows)
         summary.append(
             {
                 "provider": provider,
+                "product_name": product_name,
+                "driver": driver,
                 "storage": storage,
                 "target_rate_per_s": rate,
                 "rate_label": f"{rate}tps",
@@ -387,6 +888,7 @@ def summarize(results: list[TrialResult]) -> list[dict]:
                 "configured_max_workers": configured_max_workers,
                 "effective_max_workers": effective_max_workers,
                 "attempts": attempts,
+                "mean_excludes_first_trial": exclude_first_from_mean,
                 "api_success_rate_pct": round(
                     100 * sum(row.api_success for row in rows) / attempts, 3
                 ),
@@ -398,8 +900,9 @@ def summarize(results: list[TrialResult]) -> list[dict]:
                 ),
                 "api_latency_min_ms": round(min(api), 3) if api else None,
                 "api_latency_max_ms": round(max(api), 3) if api else None,
-                "api_latency_mean_ms": round(statistics.fmean(api), 3)
-                if api
+                "api_latency_mean_sample_count": len(api_mean),
+                "api_latency_mean_ms": round(statistics.fmean(api_mean), 3)
+                if api_mean
                 else None,
                 "api_latency_p50_ms": percentile(api, 50),
                 "api_latency_p90_ms": percentile(api, 90),
@@ -411,10 +914,11 @@ def summarize(results: list[TrialResult]) -> list[dict]:
                 "first_command_latency_max_ms": round(max(command), 3)
                 if command
                 else None,
+                "first_command_latency_mean_sample_count": len(command_mean),
                 "first_command_latency_mean_ms": round(
-                    statistics.fmean(command), 3
+                    statistics.fmean(command_mean), 3
                 )
-                if command
+                if command_mean
                 else None,
                 "first_command_latency_p50_ms": percentile(command, 50),
                 "first_command_latency_p90_ms": percentile(command, 90),
@@ -426,10 +930,13 @@ def summarize(results: list[TrialResult]) -> list[dict]:
                 "second_command_latency_max_ms": round(max(second_command), 3)
                 if second_command
                 else None,
+                "second_command_latency_mean_sample_count": len(
+                    second_command_mean
+                ),
                 "second_command_latency_mean_ms": round(
-                    statistics.fmean(second_command), 3
+                    statistics.fmean(second_command_mean), 3
                 )
-                if second_command
+                if second_command_mean
                 else None,
                 "second_command_latency_p50_ms": percentile(second_command, 50),
                 "second_command_latency_p90_ms": percentile(second_command, 90),
@@ -486,6 +993,8 @@ GLOBAL_HISTORY_DIMENSIONS = {
     "completed_at_local",
     "result_directory",
     "provider",
+    "product_name",
+    "driver",
     "storage",
     "target_rate_per_s",
     "rate_label",
@@ -498,7 +1007,16 @@ def metric_unit(metric: str) -> str:
         return "ms"
     if metric.endswith("_pct"):
         return "%"
-    if metric in {"attempts", "configured_max_workers", "effective_max_workers"}:
+    if metric == "mean_excludes_first_trial":
+        return "bool"
+    if metric in {
+        "attempts",
+        "configured_max_workers",
+        "effective_max_workers",
+        "api_latency_mean_sample_count",
+        "first_command_latency_mean_sample_count",
+        "second_command_latency_mean_sample_count",
+    }:
         return "count"
     return ""
 
@@ -526,7 +1044,7 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
     rate_columns = [f"{rate}tps" for rate in rates]
 
     # History is append-only, so later rows intentionally replace earlier cells.
-    matrix: dict[tuple[str, str, str, str, str], dict[str, str]] = {}
+    matrix: dict[tuple[str, str, str, str, str, str, str], dict[str, str]] = {}
     for row in history_rows:
         raw_rate = row.get("target_rate_per_s", "").strip()
         if not raw_rate:
@@ -539,6 +1057,8 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
             key = (
                 row.get("test_name", ""),
                 row.get("provider", ""),
+                row.get("product_name", row.get("provider", "")),
+                row.get("driver", "").strip() or "e2b",
                 row.get("storage", ""),
                 row.get("duration_seconds", ""),
                 metric,
@@ -558,18 +1078,38 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
         matrix,
         key=lambda key: (
             key[0],
-            key[2],
-            duration_sort_value(key[3]),
-            metric_order.get(key[4], len(metric_order)),
+            key[4],
+            duration_sort_value(key[5]),
+            metric_order.get(key[6], len(metric_order)),
             key[1],
         ),
     )
-    for test_name, provider, storage, duration_seconds, metric in sorted_keys:
-        values = matrix[(test_name, provider, storage, duration_seconds, metric)]
+    for (
+        test_name,
+        provider,
+        product_name,
+        driver,
+        storage,
+        duration_seconds,
+        metric,
+    ) in sorted_keys:
+        values = matrix[
+            (
+                test_name,
+                provider,
+                product_name,
+                driver,
+                storage,
+                duration_seconds,
+                metric,
+            )
+        ]
         matrix_rows.append(
             {
                 "test_name": test_name,
                 "provider": provider,
+                "product_name": product_name,
+                "driver": driver,
                 "storage": storage,
                 "duration_seconds": duration_seconds,
                 "metric": metric,
@@ -581,6 +1121,8 @@ def refresh_global_matrix(history_path: Path, matrix_path: Path) -> None:
     fieldnames = [
         "test_name",
         "provider",
+        "product_name",
+        "driver",
         "storage",
         "duration_seconds",
         "metric",
@@ -623,6 +1165,7 @@ def write_failure_logs(
                 [
                     "=" * 80,
                     f"trial_index: {row.trial_index}",
+                    f"driver: {row.driver}",
                     f"scheduled_at_utc: {row.scheduled_at_utc}",
                     f"sandbox_id: {row.sandbox_id or '(未分配)'}",
                     f"api_success: {row.api_success}",
@@ -631,6 +1174,11 @@ def write_failure_logs(
                     f"failure_phase: {row.failure_phase or '(无主流程错误)'}",
                     f"error_type: {row.error_type or '(无)'}",
                     f"error_message: {row.error_message or '(无)'}",
+                    f"ready_poll_count: {row.ready_poll_count}",
+                    (
+                        "last_observed_status: "
+                        f"{row.last_observed_status or '(无)'}"
+                    ),
                 ]
             )
             if row.error_traceback:
@@ -668,6 +1216,15 @@ def result_title(results: list[TrialResult], test_name: str) -> str:
     storages = list(dict.fromkeys(row.storage for row in results))
     rates = sorted({row.target_rate_per_s for row in results})
     durations = sorted({row.duration_seconds for row in results})
+    product_names = {row.product_name for row in results}
+    if len(product_names) != 1:
+        raise RuntimeError("同一结果目录只能保存一个产品的测试结果")
+    product_name = next(iter(product_names))
+    product_part = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", product_name).strip(
+        " ."
+    )
+    if not product_part:
+        product_part = results[0].provider
     storage_part = "-".join(storage_names.get(item, item) for item in storages)
     rate_part = "-".join(str(rate) for rate in rates) + "tps"
     duration_part = "-".join(
@@ -675,7 +1232,11 @@ def result_title(results: list[TrialResult], test_name: str) -> str:
         for value in durations
     )
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    return f"{test_name}_{storage_part}_{rate_part}_持续{duration_part}s_{stamp}"
+    raw_title = (
+        f"{stamp}_{product_part}_{test_name}_{storage_part}_"
+        f"{rate_part}_持续{duration_part}s"
+    )
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_title).strip(" .")
 
 
 def save_results(
@@ -683,18 +1244,21 @@ def save_results(
     output_root: Path,
     test_name: str,
     add_to_global: bool = False,
+    exclude_first_from_mean: bool = True,
 ) -> Path:
     if not results:
         raise RuntimeError("没有可保存的测试结果")
     providers = {row.provider for row in results}
     if len(providers) != 1:
         raise RuntimeError("同一结果目录只能保存一个厂商的测试结果")
-    provider = next(iter(providers))
     title = result_title(results, test_name)
-    output_dir = output_root / provider / title
+    output_dir = output_root / title
     output_dir.mkdir(parents=True, exist_ok=False)
     raw_rows = [asdict(row) for row in results]
-    summary_rows = summarize(results)
+    summary_rows = summarize(
+        results,
+        exclude_first_from_mean=exclude_first_from_mean,
+    )
     write_csv(output_dir / f"{title}_原始明细.csv", raw_rows)
     write_csv(output_dir / f"{title}_汇总.csv", summary_rows)
     write_failure_logs(output_dir, title, results)
@@ -709,7 +1273,7 @@ def save_results(
                 "run_id": title,
                 "test_name": test_name,
                 "completed_at_local": completed_at,
-                "result_directory": str(Path(provider) / title),
+                "result_directory": title,
                 **row,
             }
             for row in summary_rows
@@ -755,7 +1319,7 @@ def attempts_for(rates: list[int], duration: float, storages: list[str]) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="阿里云 FC 云沙箱并发启动速度测试"
+        description="多产品云沙箱并发启动速度测试"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -770,6 +1334,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = subparsers.add_parser("plan", help="只计算测试规模，不调用云端")
     run = subparsers.add_parser("run", help="执行正式并发测试")
+    run_config = subparsers.add_parser(
+        "run-config",
+        help="从 INI 配置文件选择产品和测试档位",
+    )
+    run_config.add_argument(
+        "--config",
+        type=Path,
+        default=Path("benchmark.ini"),
+        help="配置文件路径，默认 benchmark.ini",
+    )
+    run_config.add_argument(
+        "--confirm",
+        action="store_true",
+        help="确认本次调用会创建可计费云资源",
+    )
     for target in (plan, run):
         target.add_argument(
             "--provider",
@@ -812,11 +1391,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def print_plan(
     provider: str,
+    product_name: str,
     rates: list[int],
     duration: float,
     storages: list[str],
 ) -> None:
-    print(f"厂商标识: {provider}")
+    print(f"产品: {product_name} ({provider})")
     print(f"存储场景: {', '.join(storages)}")
     print(f"并发档位: {', '.join(str(rate) + '/s' for rate in rates)}")
     print(f"每档持续: {duration:g} 秒")
@@ -829,13 +1409,120 @@ def print_plan(
     print(f"预计 Sandbox.create 总次数: {attempts_for(rates, duration, storages)}")
 
 
+def execute_run(
+    *,
+    settings: Settings,
+    provider: str,
+    product_name: str,
+    rates: list[int],
+    duration_seconds: float,
+    storages: list[str],
+    max_workers: int,
+    output: Path,
+    confirm: bool,
+    exclude_first_from_mean: bool,
+) -> int:
+    if duration_seconds <= 0:
+        raise RuntimeError("duration_seconds 必须大于 0")
+    if max_workers <= 0:
+        raise RuntimeError("max_workers 必须大于 0")
+    for storage in storages:
+        metadata_for(storage, settings)
+    print_plan(provider, product_name, rates, duration_seconds, storages)
+    print(f"SDK 驱动: {settings.driver}")
+    if isinstance(settings, VolcengineNativeSettings):
+        print(
+            "火山原生就绪口径: first=首次 DescribeSandbox Ready，"
+            "second=第二次 DescribeSandbox Ready 确认；均从 Create 开始计时"
+        )
+    print(
+        "均值口径: "
+        + (
+            "每个档位第1个沙箱不计入 mean，但仍计入 min/max/百分位"
+            if exclude_first_from_mean
+            else "所有有效样本均计入 mean"
+        )
+    )
+    if not confirm:
+        print("\n未执行：正式测试请在命令末尾加 --confirm。")
+        return 2
+
+    native_runtime = (
+        VolcengineNativeRuntime(settings, max_workers)
+        if isinstance(settings, VolcengineNativeSettings)
+        else None
+    )
+    all_results: list[TrialResult] = []
+    try:
+        for storage in storages:
+            for rate in rates:
+                print(
+                    f"\n开始: product={product_name}, storage={storage}, rate={rate}/s"
+                )
+                all_results.extend(
+                    run_rate(
+                        settings=settings,
+                        provider=provider,
+                        product_name=product_name,
+                        storage=storage,
+                        rate=rate,
+                        duration_seconds=duration_seconds,
+                        max_workers=max_workers,
+                        native_runtime=native_runtime,
+                    )
+                )
+    finally:
+        if native_runtime is not None:
+            native_runtime.close()
+    output_dir = save_results(
+        all_results,
+        output,
+        "启动并发速度",
+        add_to_global=True,
+        exclude_first_from_mean=exclude_first_from_mean,
+    )
+    print(f"\n完成。结果目录: {output_dir.resolve()}")
+    print(
+        json.dumps(
+            summarize(
+                all_results,
+                exclude_first_from_mean=exclude_first_from_mean,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.command == "plan":
         if args.duration_seconds <= 0:
             raise RuntimeError("--duration-seconds 必须大于 0")
-        print_plan(args.provider, args.rates, args.duration_seconds, args.storages)
+        print_plan(
+            args.provider,
+            DEFAULT_PRODUCT_NAMES.get(args.provider, args.provider),
+            args.rates,
+            args.duration_seconds,
+            args.storages,
+        )
         return 0
+
+    if args.command == "run-config":
+        configured = load_configured_run(args.config)
+        return execute_run(
+            settings=configured.settings,
+            provider=configured.provider,
+            product_name=configured.product_name,
+            rates=configured.rates,
+            duration_seconds=configured.duration_seconds,
+            storages=configured.storages,
+            max_workers=configured.max_workers,
+            output=configured.output,
+            confirm=args.confirm,
+            exclude_first_from_mean=configured.exclude_first_from_mean,
+        )
 
     settings = load_settings(require_credentials=True)
     if args.command == "smoke":
@@ -844,6 +1531,7 @@ def main() -> int:
         result = one_trial(
             settings=settings,
             provider=args.provider,
+            product_name=DEFAULT_PRODUCT_NAMES.get(args.provider, args.provider),
             storage=args.storage,
             rate=1,
             duration_seconds=1.0,
@@ -858,40 +1546,18 @@ def main() -> int:
         print(f"结果目录: {output_dir.resolve()}")
         return 0 if result.ready_success and result.cleanup_success else 1
 
-    if args.duration_seconds <= 0:
-        raise RuntimeError("--duration-seconds 必须大于 0")
-    if args.max_workers <= 0:
-        raise RuntimeError("--max-workers 必须大于 0")
-    for storage in args.storages:
-        metadata_for(storage, settings)
-    print_plan(args.provider, args.rates, args.duration_seconds, args.storages)
-    if not args.confirm:
-        print("\n未执行：正式测试请在命令末尾加 --confirm。")
-        return 2
-
-    all_results: list[TrialResult] = []
-    for storage in args.storages:
-        for rate in args.rates:
-            print(f"\n开始: storage={storage}, rate={rate}/s")
-            all_results.extend(
-                run_rate(
-                    settings=settings,
-                    provider=args.provider,
-                    storage=storage,
-                    rate=rate,
-                    duration_seconds=args.duration_seconds,
-                    max_workers=args.max_workers,
-                )
-            )
-    output_dir = save_results(
-        all_results,
-        args.output,
-        "启动并发速度",
-        add_to_global=True,
+    return execute_run(
+        settings=settings,
+        provider=args.provider,
+        product_name=DEFAULT_PRODUCT_NAMES.get(args.provider, args.provider),
+        rates=args.rates,
+        duration_seconds=args.duration_seconds,
+        storages=args.storages,
+        max_workers=args.max_workers,
+        output=args.output,
+        confirm=args.confirm,
+        exclude_first_from_mean=True,
     )
-    print(f"\n完成。结果目录: {output_dir.resolve()}")
-    print(json.dumps(summarize(all_results), ensure_ascii=False, indent=2))
-    return 0
 
 
 if __name__ == "__main__":
